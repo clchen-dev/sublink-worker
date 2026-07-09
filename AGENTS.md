@@ -1,87 +1,125 @@
 # AGENTS.md
 
-## 协作偏好
+## Collaboration preferences
 
-- 用中文回复；代码注释用英文，注释写 why 不写 how。
-- 简洁直接，不要多余总结和解释；除非存在高风险或信息缺口，直接写代码。
-- 函数式优先，TS/JS 中避免 OOP；新功能优先复用或重构现有代码。
-- 遵循 KISS、DRY 原则；从第一性原理解构问题，警惕 XY 问题。
-- 发现不合理的需求或方向要立即指出，不奉承。
+- Reply in Chinese; code comments in English, write *why* not *how*.
+- Be concise and direct; no unnecessary summaries or explanations. Write code
+  directly unless there's high risk or missing information.
+- Favor functional style; avoid OOP in TS/JS. Prefer reusing or refactoring
+  existing code over adding new abstractions.
+- Follow KISS and DRY; break down problems from first principles; watch for
+  XY problems.
+- Immediately flag unreasonable requirements or wrong directions.
 
-## 项目概览
+## Project overview
 
-Sublink Worker 是多平台代理订阅转换器：将各类协议（ShadowSocks/VMess/VLESS/Hysteria2/Trojan/TUIC）转为客户端配置（Sing-Box/Clash/Xray/Surge）。同一份代码跑在 Cloudflare Workers / Node.js / Vercel / Docker 上。技术栈：Hono（Web/JSX SSR）+ Vitest + Wrangler + esbuild + ioredis。
+Sublink Worker is a multi-platform proxy subscription converter: it transforms
+protocol links (ShadowSocks/VMess/VLESS/Hysteria2/Trojan/TUIC) into
+client-specific configs (Sing-Box/Clash/Xray/Surge). Same codebase runs on
+Cloudflare Workers / Node.js / Vercel / Docker.
 
-## 常用命令
+Tech stack: Hono (Web + JSX SSR) + Vitest + Wrangler + esbuild + ioredis.
 
-- `npm run dev` — Wrangler 本地开发（Cloudflare Workers 入口）
-- `npm run dev:node` — esbuild bundle + 启动 Node.js server
-- `npm test` — Vitest（基于 `@cloudflare/vitest-pool-workers`，依赖 `wrangler.toml`）
-- `npx vitest test/<file>.test.js` — 跑单个测试文件
-- `npm run build` — Vercel 构建（输出到 `dist/vercel/`）
-- `npm run deploy` — `setup-kv` + `wrangler deploy`
+## Supported protocols & formats
 
-无 ESLint/Prettier/Biome 配置，未启用自动格式化。
+| Input | Output |
+|---|---|
+| ss://, vmess://, vless://, trojan://, hysteria2://, tuic:// | Sing-Box JSON |
+| Base64 subscription strings | Clash YAML |
+| HTTP/HTTPS subscription URLs | Surge INI |
+| Sing-Box JSON / Clash YAML / Surge INI configs | Xray/Base64 (passthrough) |
+| Full configs with DNS, rules, etc. (merged on top of base) | Subconverter INI |
 
-## 多运行时架构
+17 predefined rule presets (Ad Block, AI, Bilibili, YouTube, Google,
+Telegram, GitHub, Microsoft, Apple, Social Media, Streaming, Gaming, etc.)
+with min/balanced/comprehensive profiles.
 
-入口分平台：`src/worker.jsx`（Cloudflare）、`src/platforms/node-server.js`（Node/Docker）、`api/index.js`（Vercel）。三者都通过 `createApp(runtime)`（`src/app/createApp.jsx`）创建同一个 Hono app。
+## Multi-runtime architecture
 
-- `src/runtime/{cloudflare,node,vercel}.js` 提供平台适配
-- `src/runtime/runtimeConfig.js` 规范化 KV、资源获取、日志、环境变量默认值
+Entry points: `src/worker.jsx` (CF Workers), `src/platforms/node-server.js`
+(Node/Docker), `api/index.js` (Vercel). All call `createApp(runtime)` from
+`src/app/createApp.jsx` to build the same Hono app.
 
-新增运行时：在 `src/runtime/` 加 adapter，按需在 `src/adapters/kv/` 加 KV 实现，按需在 `src/platforms/` 加入口。
+- `src/runtime/{cloudflare,node,vercel}.js` — platform adapters
+- `src/runtime/runtimeConfig.js` — normalizes KV, asset fetcher, logger, env defaults
+- KV adapters in `src/adapters/kv/`: CloudflareKV, RedisKV (ioredis), UpstashKV (REST), MemoryKV
+- Node/Vercel KV priority: Redis > Upstash > Memory (`DISABLE_MEMORY_KV=true` to disable fallback)
+- ShortLinkService and ConfigStorageService (30-day TTL)
 
-## KV 存储抽象
+Env vars: `REDIS_URL`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`,
+`REDIS_TLS`, `REDIS_KEY_PREFIX`, `KV_REST_API_URL`, `KV_REST_API_TOKEN`,
+`CONFIG_TTL_SECONDS`, `SHORT_LINK_TTL_SECONDS`, `STATIC_DIR`, `PORT`.
 
-统一接口：`get(key)`、`put(key, value, options)`、`delete(key)`。实现：`CloudflareKVAdapter`、`RedisKVAdapter`（ioredis）、`UpstashKVAdapter`（REST）、`MemoryKVAdapter`。
+## Config generation pipeline
 
-- 服务层：`ShortLinkService`（短链）、`ConfigStorageService`（base config 存储，默认 30 天 TTL）
-- Node/Vercel 优先级：Redis > Upstash/Vercel KV > 内存兜底；`DISABLE_MEMORY_KV=true` 关闭兜底
-- Cloudflare 用 `wrangler.toml` 的 `SUBLINK_KV` 与 `ASSETS` binding
+```
+Input (URL + query params)
+  → BaseConfigBuilder.build()
+    → parseCustomItems()
+      → Try direct parse (JSON/YAML/INI)
+      → Try Base64 decode + parse
+      → Per line:
+        → HTTP URL → fetchSubscriptionWithFormat()
+                     → detectFormat() → parseSubscriptionContent()
+                     → extract proxies + config overrides
+        → Protocol URI → ProxyParser.parse()
+                         → scheme dispatcher → protocol parser
+                         → returns { tag, type, server, server_port, ... }
+    → addCustomItems() — convert proxies to target format
+    → addSelectors() — auto-select, node-select, country groups,
+                       outbound groups, custom rule groups, fallback
+    → formatConfig() — output YAML/JSON/INI/Base64
+```
 
-环境变量：`REDIS_URL` / `REDIS_HOST`+`REDIS_PORT` / `REDIS_USERNAME` / `REDIS_PASSWORD` / `REDIS_TLS` / `REDIS_KEY_PREFIX`、`KV_REST_API_URL`+`KV_REST_API_TOKEN`、`CONFIG_TTL_SECONDS`、`SHORT_LINK_TTL_SECONDS`、`STATIC_DIR`、`PORT`。
+### Adding a new protocol
 
-## 协议解析与配置构建
+1. Add parser in `src/parsers/protocols/<name>Parser.js`
+2. Register in `src/parsers/ProxyParser.js` protocolParsers map
+3. Add converter logic in each builder (Clash/Singbox/Surge)
+4. Add tests in `test/`
 
-**ProxyParser**（`src/parsers/ProxyParser.js`）按 URL scheme 分发到 `src/parsers/protocols/<protocol>Parser.js`。HTTP(S) 订阅走 `httpSubscriptionFetcher` → `subscriptionContentParser`，自动识别 Sing-Box JSON / Clash YAML / Surge INI / Base64 列表。
+## Builders (Template Method pattern)
 
-返回值约定：
-- 协议 parser：`{ tag, type, ...protocolFields }`
-- 订阅级 parser：`{ type: 'yamlConfig'|'singboxConfig'|'surgeConfig', config, proxies }`
+All extend `BaseConfigBuilder`. Must implement:
 
-**新增协议**：在 `src/parsers/protocols/` 加 parser，并在 `ProxyParser.js` 的 `protocolParsers` map 注册。
+- `getProxies()`, `getProxyName(proxy)`, `convertProxy(proxy)`
+- `addProxyToConfig(proxy)`, `addAutoSelectGroup(list)`
+- `addNodeSelectGroup(list)`, `addOutboundGroups(outbounds, list)`
+- `addCustomRuleGroups(list)`, `addFallBackGroup(list)`
+- `addCountryGroups()`, `formatConfig()`
 
-**Builder 模式**：`SingboxConfigBuilder` / `ClashConfigBuilder` / `SurgeConfigBuilder` 都继承 `BaseConfigBuilder`。子类必须实现：`getProxies()`、`getProxyName(proxy)`、`convertProxy(proxy)`、`addProxyToConfig(proxy)`、`addAutoSelectGroup(list)`、`addNodeSelectGroup(list)`、`addOutboundGroups(outbounds, list)`、`addCustomRuleGroups(list)`、`addFallBackGroup(list)`、`addCountryGroups()`、`formatConfig()`。
+Country grouping via `src/utils.js#groupProxiesByCountry` (31 countries,
+regex matching with word boundaries).
 
-**Config Override**：订阅含完整配置时，`applyConfigOverrides()` 合并非代理字段到 base config；blacklist（proxies、rules、rule-providers）永远不被覆盖；Clash `proxy-groups` 可被订阅覆盖以保留用户分组结构。
+## Deployment
 
-国家分组逻辑在 `src/utils.js#groupProxiesByCountry`。
+| Platform | Entry | Command |
+|---|---|---|
+| Cloudflare Workers | `src/worker.jsx` | `npm run deploy` (runs setup-kv + wrangler deploy) |
+| Vercel | `api/index.js` | `npm run build` (esbuild) |
+| Node.js | `node-server.js` | `npm run build:node && node dist/node-server.cjs` |
+| Docker | `Dockerfile` (GHCR) | `docker compose up` (includes Redis) |
 
-## 测试
+## Testing
 
-Vitest + `@cloudflare/vitest-pool-workers`，配置 `vitest.config.js` 指向 `wrangler.toml`。测试文件在 `test/`。
+Vitest + `@cloudflare/vitest-pool-workers`:
 
-- 写测试时用 `MemoryKVAdapter` 做 KV，用 `createApp(runtime)` 拿到可测的 Hono app
-- 覆盖：路由、各 builder、各 parser（含 YAML 订阅）、country grouping、selectedRules 向后兼容
+```bash
+npm test                    # All tests
+npx vitest test/<file>.test.js   # Single file
+npx vitest -t "<pattern>"        # Match test name
+```
 
-## 关键约定
+Tests use `MemoryKVAdapter` and `createApp(runtime)` for the Hono app.
 
-- `.jsx` 文件用 Hono JSX runtime，**不是 React**
-- Base64 输入用 `tryDecodeSubscriptionLines()` 处理（同时支持原文和 Base64）
-- 错误用 `ServiceError` 子类（`InvalidPayloadError`、`MissingDependencyError`），返回干净响应
-- i18n：zh-CN / en-US / fa-IR，文件在 `src/i18n/`
+## i18n
 
-## 本地工作流
+zh-CN / en-US / fa-IR / ru in `src/i18n/index.js`. Language detection from
+`lang` query param or `Accept-Language` header.
 
-- 本地分层规划放 `.roadmap/roadmap.md`（已 `.gitignore`）；更新前先同步 GitHub open issues
-- 个人偏好、沙盒、临时上下文写入 `AGENTS.local.md`（不提交）
-- Claude 共享规则放 `CLAUDE.md`，个人覆盖放 `CLAUDE.local.md`
+## Key conventions
 
-## 文档参考
-
-代理工具配置问题查官方文档：
-- sing-box: https://sing-box.sagernet.org/
-- clash/mihomo: https://wiki.metacubex.one/
-- surge: https://blankwonder.gitbooks.io/surge-manual/content/
-- xray: https://xtls.github.io/config/
+- `.jsx` files use Hono JSX runtime, **not React**
+- Base64 input: use `tryDecodeSubscriptionLines()`
+- Errors: `ServiceError` subclasses (`InvalidPayloadError` etc.)
+- No ESLint/Prettier/Biome — no auto-formatting
